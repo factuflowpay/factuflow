@@ -1606,7 +1606,7 @@ async function testEmail(){
 
 // DRIVE
 function driveAuth(){
-  const client=google.accounts.oauth2.initTokenClient({client_id:'YOUR_GOOGLE_CLIENT_ID.apps.googleusercontent.com',scope:'https://www.googleapis.com/auth/drive.file',
+  const client=google.accounts.oauth2.initTokenClient({client_id:'432896723726-d1is110fc2too43d50d5pe7lgpvj24u9.apps.googleusercontent.com',scope:'https://www.googleapis.com/auth/drive.file',
     callback:(resp)=>{if(resp.error){toast('Error Drive: '+resp.error,'err');return;}driveToken=resp.access_token;localStorage.setItem(DRIVE_TK,driveToken);toast('✅ Google Drive conectado');updateCoHeader();renderView();}});
   client.requestAccessToken();
 }
