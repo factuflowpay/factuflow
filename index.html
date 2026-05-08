@@ -472,7 +472,390 @@ tbody tr.selected-row td{background:var(--co-colorbg)!important;}
 // ═══════════════════════════════════════════════════════════
 // CONSTANTS
 // ═══════════════════════════════════════════════════════════
-const SK = 'ff6_data';
+
+// ═══════════════════════════════════════════════════════════════════════
+// PERSISTENCE LAYER v2 — IndexedDB + localStorage fallback
+// Regla: el resto del código NO sabe qué motor se usa.
+// Solo llama saveDB() y loadDB() como siempre.
+// ═══════════════════════════════════════════════════════════════════════
+
+const DB_NAME   = 'FactuFlowDB';
+const DB_VER    = 2;
+const STORE_KEY = 'state';
+const LS_SK     = 'ff6_data';
+const BACKUP_INTERVAL_MS = 10 * 60 * 1000;
+
+let _idb          = null;
+let _idbReady     = false;
+let _idbFailed    = false;
+let _saveQueue    = null;
+let _isDirty      = false;
+let _lastSavedHash = '';
+
+// BroadcastChannel: sincronización entre pestañas
+let _bc = null;
+try {
+  _bc = new BroadcastChannel('factuflow_sync');
+  _bc.onmessage = (e) => {
+    if(e.data?.type === 'db_updated' && e.data?.tabId !== _tabId) {
+      // Otra pestaña guardó datos — recargar desde IDB sin perder la vista actual
+      _reloadFromIDB();
+    }
+  };
+} catch(e) { /* BroadcastChannel no disponible en este browser */ }
+const _tabId = Math.random().toString(36).slice(2); // ID único por pestaña
+
+async function _reloadFromIDB() {
+  if(!_idbReady) return;
+  try {
+    const data = await idbGet(STORE_KEY, 'main');
+    if(data && validateDB(data)) {
+      const currentHash = quickHash(data);
+      if(currentHash === _lastSavedHash) return; // sin cambios reales
+      DB = { ...DB, ...data };
+      _lastSavedHash = currentHash;
+      updateCoHeader();
+      renderView();
+      toast('🔄 Datos actualizados desde otra pestaña', 'info');
+    }
+  } catch(e) { /* silencioso */ }
+}
+
+function openIDB() {
+  return new Promise((resolve, reject) => {
+    if(!window.indexedDB) { reject(new Error('IDB not supported')); return; }
+    const req = indexedDB.open(DB_NAME, DB_VER);
+    req.onupgradeneeded = (e) => {
+      const db = e.target.result;
+      if(!db.objectStoreNames.contains(STORE_KEY))
+        db.createObjectStore(STORE_KEY);
+      if(!db.objectStoreNames.contains('backups'))
+        db.createObjectStore('backups', { autoIncrement: true });
+      if(!db.objectStoreNames.contains('logs'))
+        db.createObjectStore('logs',    { autoIncrement: true });
+    };
+    req.onsuccess = (e) => resolve(e.target.result);
+    req.onerror   = (e) => reject(e.target.error);
+    req.onblocked = ()  => reject(new Error('IDB blocked'));
+  });
+}
+
+function idbGet(storeName, key) {
+  return new Promise((resolve, reject) => {
+    if(!_idb) { reject(new Error('IDB not open')); return; }
+    const req = _idb.transaction(storeName,'readonly').objectStore(storeName).get(key);
+    req.onsuccess = () => resolve(req.result);
+    req.onerror   = () => reject(req.error);
+  });
+}
+
+function idbPut(storeName, key, value) {
+  return new Promise((resolve, reject) => {
+    if(!_idb) { reject(new Error('IDB not open')); return; }
+    const tx  = _idb.transaction(storeName,'readwrite');
+    const req = (key !== null && key !== undefined)
+      ? tx.objectStore(storeName).put(value, key)
+      : tx.objectStore(storeName).put(value);
+    tx.oncomplete = () => resolve();
+    tx.onerror    = () => reject(tx.error);
+  });
+}
+
+function idbDelete(storeName, key) {
+  return new Promise((resolve, reject) => {
+    if(!_idb) { reject(new Error('IDB not open')); return; }
+    const tx  = _idb.transaction(storeName,'readwrite');
+    const req = tx.objectStore(storeName).delete(key);
+    tx.oncomplete = () => resolve();
+    tx.onerror    = () => reject(tx.error);
+  });
+}
+
+function idbGetAll(storeName) {
+  return new Promise((resolve, reject) => {
+    if(!_idb) { resolve([]); return; }
+    const req = _idb.transaction(storeName,'readonly').objectStore(storeName).getAll();
+    req.onsuccess = () => resolve(req.result||[]);
+    req.onerror   = () => reject(req.error);
+  });
+}
+
+function idbClearStore(storeName) {
+  return new Promise((resolve, reject) => {
+    if(!_idb) { resolve(); return; }
+    const req = _idb.transaction(storeName,'readwrite').objectStore(storeName).clear();
+    req.onsuccess = () => resolve();
+    req.onerror   = () => reject(req.error);
+  });
+}
+
+async function dbLog(level, msg, data={}) {
+  try {
+    const entry = { ts: Date.now(), level, msg, data };
+    if(_idbReady) await idbPut('logs', null, entry);
+    if(level==='error') console.error('[FactuFlow]', msg, data);
+    else if(level==='warn') console.warn('[FactuFlow]', msg, data);
+  } catch(e) {}
+}
+
+function quickHash(obj) {
+  try {
+    const s = JSON.stringify(obj);
+    let h = 0;
+    for(let i = 0; i < Math.min(s.length, 8000); i++) {
+      h = ((h << 5) - h) + s.charCodeAt(i); h |= 0;
+    }
+    return h.toString(36) + '_' + s.length;
+  } catch(e) { return Date.now().toString(36); }
+}
+
+function validateDB(data) {
+  if(!data || typeof data !== 'object') return false;
+  if(!Array.isArray(data.companies))   return false;
+  if(typeof data.clients !== 'object') return false;
+  if(!Array.isArray(data.invoices))    return false;
+  if(typeof data.config  !== 'object') return false;
+  return true;
+}
+
+async function createBackupSnapshot(label='auto') {
+  try {
+    // Para snapshots automáticos: excluir logos (base64 pesados) para ahorrar espacio
+    // Los exports manuales (exportFullBackup) sí incluyen logos
+    const isAutoSnap = label === 'auto' || label === 'startup';
+    const dataClean = JSON.parse(JSON.stringify(DB));
+    if(isAutoSnap && dataClean.companies) {
+      dataClean.companies = dataClean.companies.map(co => ({
+        ...co,
+        logo: co.logo ? '__logo_omitted__' : null, // placeholder, no pierde el hecho de que existía
+      }));
+    }
+    const snap = {
+      ts: Date.now(), label,
+      version: DB_VER,
+      hasLogos: !isAutoSnap,
+      data: dataClean,
+    };
+    if(_idbReady) {
+      await idbPut('backups', null, snap);
+      // Mantener solo últimos 25 backups
+      const all = await idbGetAll('backups');
+      if(all.length > 25) {
+        await idbClearStore('backups');
+        for(const b of all.sort((a,b)=>b.ts-a.ts).slice(0,25))
+          await idbPut('backups', null, b);
+      }
+    } else {
+      try {
+        localStorage.setItem('ff_bk_'+snap.ts, JSON.stringify(snap));
+        const bkKeys = Object.keys(localStorage).filter(k=>k.startsWith('ff_bk_'));
+        bkKeys.sort().slice(0,-5).forEach(k=>localStorage.removeItem(k));
+      } catch(e) {}
+    }
+  } catch(e) { console.warn('[FactuFlow] Backup failed:', e.message); }
+}
+
+async function listBackups() {
+  const result = [];
+  if(_idbReady) {
+    try { result.push(...await idbGetAll('backups')); } catch(e) {}
+  }
+  Object.keys(localStorage).filter(k=>k.startsWith('ff_bk_')).forEach(k=>{
+    try { result.push(JSON.parse(localStorage.getItem(k))); } catch(e) {}
+  });
+  return result.sort((a,b)=>b.ts-a.ts);
+}
+
+async function restoreFromBackup(backupTs) {
+  const backups = await listBackups();
+  const snap = backups.find(b=>b.ts===backupTs);
+  if(!snap||!validateDB(snap.data)) { toast('Backup inválido','err'); return; }
+  await createBackupSnapshot('pre-restore');
+  const restored = JSON.parse(JSON.stringify(snap.data));
+  // Si el snapshot no tenía logos, preservar los logos actuales de las empresas
+  if(!snap.hasLogos && restored.companies && DB.companies) {
+    restored.companies = restored.companies.map(rc => {
+      const current = DB.companies.find(c => c.id === rc.id);
+      return { ...rc, logo: (rc.logo === '__logo_omitted__' && current) ? current.logo : rc.logo };
+    });
+  }
+  DB = restored;
+  await _flushSave();
+  currentCoId = DB.companies[0]?.id||null;
+  toast('Datos restaurados desde ' + new Date(backupTs).toLocaleString('es-CR'));
+  closeModal(); renderView(); updateCoHeader();
+}
+
+async function showBackupsModal() {
+  const backups = await listBackups();
+  if(!backups.length) { toast('Sin backups disponibles','warn'); return; }
+  const rows = backups.slice(0,15).map(b=>`
+    <div style="display:flex;align-items:center;gap:12px;padding:10px 0;border-bottom:1px solid var(--bdr)">
+      <div style="flex:1">
+        <div style="font-size:13px;font-weight:600">${new Date(b.ts).toLocaleString('es-CR')}</div>
+        <div style="font-size:11px;color:var(--muted)">${b.label||'auto'} · ${b.data?.companies?.length||0} empresa(s) · ${b.data?.invoices?.length||0} factura(s)${b.hasLogos===false?' · sin logos (auto)':''}</div>
+      </div>
+      <button class="btn btn-outline btn-sm" onclick="restoreFromBackup(${b.ts})">Restaurar</button>
+    </div>`).join('');
+  showModal('modal-md',`<div class="modal-head"><h3>💾 Backups Disponibles</h3><button class="btn btn-ghost" onclick="closeModal()">✕</button></div>
+    <div class="modal-body" style="max-height:60vh;overflow-y:auto">${rows}</div>
+    <div class="modal-foot"><button class="btn btn-outline" onclick="closeModal()">Cerrar</button>
+    <button class="btn btn-co" onclick="exportFullBackup()">📥 Exportar JSON</button></div>`);
+}
+
+// ── saveDB / _flushSave ───────────────────────────────────────────────
+function saveDB() {
+  _isDirty = true;
+  if(_saveQueue) clearTimeout(_saveQueue);
+  _saveQueue = setTimeout(_flushSave, 400);
+}
+
+async function _flushSave() {
+  _saveQueue = null;
+  if(!_isDirty) return;
+  const hash = quickHash(DB);
+  if(hash === _lastSavedHash) { _isDirty = false; return; }
+  const payload = JSON.parse(JSON.stringify(DB));
+  payload._savedAt = new Date().toISOString();
+  payload._version = DB_VER;
+  let saved = false;
+  if(_idbReady) {
+    try {
+      await idbPut(STORE_KEY, 'main', payload);
+      localStorage.setItem('ff_meta', JSON.stringify({
+        savedAt: payload._savedAt, version: DB_VER,
+        companies: DB.companies.length, invoices: DB.invoices.length,
+      }));
+      _lastSavedHash = hash; _isDirty = false; saved = true;
+      // Notificar otras pestañas
+      try { if(_bc) _bc.postMessage({ type:'db_updated', tabId:_tabId, ts:Date.now() }); } catch(e) {}
+    } catch(e) { dbLog('error','IDB save failed',{err:e.message}); }
+  }
+  if(!saved) {
+    try {
+      localStorage.setItem(LS_SK, JSON.stringify(payload));
+      _lastSavedHash = hash; _isDirty = false;
+    } catch(e) {
+      if(e.name==='QuotaExceededError') toast('⚠ Almacenamiento lleno — exportá un backup','warn');
+    }
+  }
+}
+
+// ── loadDB ────────────────────────────────────────────────────────────
+async function loadDB() {
+  // Abrir IDB
+  try {
+    _idb = await openIDB();
+    _idbReady = true;
+  } catch(e) {
+    _idbFailed = true;
+    console.warn('[FactuFlow] IndexedDB no disponible, usando localStorage:', e.message);
+  }
+  let data = null;
+  // Intentar IDB
+  if(_idbReady) {
+    try {
+      data = await idbGet(STORE_KEY, 'main');
+      if(!validateDB(data)) data = null;
+    } catch(e) { data = null; }
+  }
+  // Fallback y migración desde localStorage
+  if(!data) {
+    const raw = localStorage.getItem(LS_SK);
+    if(raw) {
+      try {
+        const parsed = JSON.parse(raw);
+        if(validateDB(parsed)) {
+          data = parsed;
+          if(_idbReady) {
+            try {
+              await idbPut(STORE_KEY, 'main', data);
+              localStorage.setItem('ff_migrated_at', new Date().toISOString());
+              setTimeout(()=>toast('✅ Almacenamiento mejorado — tus datos están más seguros','ok'), 1500);
+            } catch(e) {}
+          }
+        }
+      } catch(e) {}
+    }
+  }
+  // Aplicar datos
+  if(data && validateDB(data)) {
+    DB = { ...DB, ...data };
+    DB.config = DB.config||{};
+    if(!DB.config.exchangeRate)        DB.config.exchangeRate = 520;
+    if(!DB.config.exchangeRateUpdated) DB.config.exchangeRateUpdated = null;
+    _fxRate   = DB.config.exchangeRate;
+    _fxUpdated = DB.config.exchangeRateUpdated
+      ? new Date(DB.config.exchangeRateUpdated).toLocaleTimeString('es-CR',{hour:'2-digit',minute:'2-digit'})
+      : null;
+    // Dedup clientes
+    Object.keys(DB.clients).forEach(coId=>{
+      const seen=new Set();
+      DB.clients[coId]=(DB.clients[coId]||[]).filter(cl=>{
+        if(seen.has(cl.id)) return false;
+        seen.add(cl.id); return true;
+      });
+    });
+    // Backup inicial
+    createBackupSnapshot('startup').catch(()=>{});
+  } else {
+    seed();
+    await _flushSave();
+  }
+  // Auto-backup + flush cada 10 min
+  setInterval(async ()=>{
+    if(_isDirty) await _flushSave();
+    createBackupSnapshot('auto').catch(()=>{});
+  }, BACKUP_INTERVAL_MS);
+}
+
+// ── exportFullBackup / importFullBackup / clearAllData ────────────────
+async function exportFullBackup() {
+  await _flushSave();
+  const snap = {
+    _type:'FactuFlowBackup', _version:DB_VER,
+    _exportedAt: new Date().toISOString(),
+    ...JSON.parse(JSON.stringify(DB)),
+  };
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(new Blob([JSON.stringify(snap,null,2)],{type:'application/json'}));
+  a.download = `FactuFlow_backup_${today()}.json`;
+  a.click(); toast('Backup exportado ✓');
+}
+
+function importFullBackup(e) {
+  const f = e.target.files[0]; if(!f) return;
+  const r = new FileReader();
+  r.onload = async (ev) => {
+    try {
+      const data = JSON.parse(ev.target.result);
+      if(!validateDB(data)) { toast('Archivo inválido','err'); return; }
+      await createBackupSnapshot('pre-import');
+      DB = { ...DB, ...data };
+      await _flushSave();
+      currentCoId = DB.companies[0]?.id||null;
+      renderView(); updateCoHeader();
+      toast('Datos importados ✓');
+    } catch(err) { toast('Error: '+err.message,'err'); }
+  };
+  r.readAsText(f); e.target.value='';
+}
+
+async function clearAllData() {
+  await createBackupSnapshot('pre-clear');
+  if(_idbReady) { try { await idbDelete(STORE_KEY,'main'); } catch(e){} }
+  ['ff6_data','ff_meta'].forEach(k=>localStorage.removeItem(k));
+  seed(); await _flushSave();
+  currentCoId = DB.companies[0]?.id||null;
+  renderView(); updateCoHeader();
+  toast('Datos limpiados','warn');
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// FIN PERSISTENCE LAYER v2
+// ═══════════════════════════════════════════════════════════════════════
+
+const SK = 'ff6_data'; // alias — usar LS_SK internamente
 const DRIVE_TK = 'ff3_drive';
 const CURRENCIES = [{code:'USD',symbol:'$',name:'Dólar'},{code:'CRC',symbol:'₡',name:'Colón'},{code:'EUR',symbol:'€',name:'Euro'}];
 const PHONE_CODES = [{code:'+506',label:'🇨🇷 +506'},{code:'+1',label:'🇺🇸 +1'},{code:'+34',label:'🇪🇸 +34'},{code:'+52',label:'🇲🇽 +52'},{code:'+57',label:'🇨🇴 +57'},{code:'+503',label:'🇸🇻 +503'},{code:'+502',label:'🇬🇹 +502'},{code:'+507',label:'🇵🇦 +507'}];
@@ -481,7 +864,7 @@ let _fxUpdated = null;
 let _statMode = 'original';
 let _tags = {};
 let _invItems = [], _invTax = false, _invCurr = 'USD';
-let DB = { companies:[], clients:{}, invoices:[], config:{ emailjsService:'', emailjsTemplate:'', emailjsPublic:'', lastBackup:'', exchangeRate:520, exchangeRateUpdated:null } };
+let DB = { companies:[], clients:{}, invoices:[], config:{ emailjsService:'Factuflow', emailjsTemplate:'template_gx1gzqc', emailjsPublic:'hsA4NJnJmWRURrxlN', lastBackup:'', exchangeRate:456.96, exchangeRateUpdated:null, googleClientId:'432896723726-dlis1l0fc2too43d50d5pe7lgpvj24u9.apps.googleusercontent.com' } };
 let driveToken = null;
 let currentCoId = null, currentView = 'dashboard', prevView = null, clientSearch = '';
 let selectedClients = new Set();
@@ -499,6 +882,7 @@ let _reportPeriod = 'month', _reportFrom = '', _reportTo = '';
 // ═══════════════════════════════════════════════════════════
 const uid = () => Math.random().toString(36).slice(2,8).toUpperCase();
 const today = () => new Date().toISOString().split('T')[0];
+
 const fmtDate = (s) => {
   if(!s) return '—';
   const [y,m,d] = s.split('-');
@@ -633,33 +1017,8 @@ function getUpcomingClients(daysAhead=14) {
 // ═══════════════════════════════════════════════════════════
 // DATA
 // ═══════════════════════════════════════════════════════════
-function loadDB() {
-  try {
-    const r=localStorage.getItem(SK);
-    if(r) {
-      DB={...DB,...JSON.parse(r)};
-      if(!DB.config.exchangeRate) DB.config.exchangeRate = 520;
-      if(!DB.config.exchangeRateUpdated) DB.config.exchangeRateUpdated = null;
-      _fxRate = DB.config.exchangeRate;
-      _fxUpdated = DB.config.exchangeRateUpdated ? new Date(DB.config.exchangeRateUpdated).toLocaleTimeString('es-CR',{hour:'2-digit',minute:'2-digit'}) : null;
-      Object.keys(DB.clients).forEach(coId=>{
-        const seen=new Set();
-        DB.clients[coId]=(DB.clients[coId]||[]).filter(cl=>{
-          const key=cl.id;
-          if(seen.has(key)) return false;
-          seen.add(key); return true;
-        });
-      });
-    } else seed();
-  } catch(e) { seed(); }
-}
-function saveDB() {
-  try {
-    localStorage.setItem(SK, JSON.stringify(DB));
-  } catch(e) {
-    if(e.name==='QuotaExceededError') toast('Almacenamiento lleno. Exportá un backup.','warn');
-  }
-}
+// loadDB: see PERSISTENCE LAYER v2
+// saveDB: see PERSISTENCE LAYER v2
 function seed() {
   DB.companies=[
     { id:'c1', name:'Apartamentos Vista Mar', shortName:'Vista Mar', color:'#c9943a', primaryColor:'#c9943a', email:'info@vistamar.cr', phone:'+506 2222-3333', address:'Escazú, San José, Costa Rica', taxId:'3-101-445512', website:'www.vistamar.cr', logo:null, invoicePrefix:'VM', nextInvoice:10, currency:'USD', invoiceTemplate:'modern', customFields:[{label:'Apartamento',key:'apartment',type:'text'},{label:'Renta Mensual',key:'rent',type:'money'}], ccEmails:['contabilidad@vistamar.cr'], invoiceNotes:'El pago debe realizarse dentro de los primeros 5 días del mes. Incluir número de apartamento en la referencia.', bankInfo:'Banco Nacional · Cta. 100-01-088-123456-7 · IBAN CR21015108410026012345', notes:'Complejo residencial de 12 apartamentos en Escazú.' },
@@ -1186,7 +1545,7 @@ function renderHistory() {
     <td class="td-id">${escH(inv.id)}</td><td class="td-name">${escH(inv.clName)}</td><td class="td-muted">${fmtDate(inv.date)}</td>
     <td style="font-size:12.5px;color:${isOD(inv)?'var(--red)':'var(--txt2)'};font-weight:${isOD(inv)?600:400}">${fmtDate(inv.dueDate)}${isOD(inv)?' ⚠':''}</td>
     <td class="td-amount">${fmtM(inv.total,inv.currency)}</td><td style="font-size:12px;color:var(--muted)">${crcEquiv}</td>
-    <td>${statusBadge(inv)}</td><td style="font-size:12px;color:var(--muted)">${inv.condicionVenta||'—'}</td>
+    <td>${statusBadge(inv)}</td><td style="font-size:12px;color:var(--muted)">${inv.condicionVenta||inv.condVenta||'—'}</td>
     <td style="font-size:12px;color:var(--muted)">${inv.formaPago||'—'}</td>
     <td>${rowActions(inv,true)}</td>
   </tr>`; });
@@ -1269,7 +1628,7 @@ function renderConfig() {
       <div class="form-grid g2" style="margin-bottom:14px">
         <div class="field">
           <label>Google Client ID</label>
-          <input id="cfg-google-id" value="${escH(DB.config.googleClientId||'')}" placeholder="123456789-xxx.apps.googleusercontent.com" style="font-size:11px">
+          <input id="cfg-google-id" value="${escH(DB.config.googleClientId||'432896723726-dlis1l0fc2too43d50d5pe7lgpvj24u9.apps.googleusercontent.com')}" placeholder="123456789-xxx.apps.googleusercontent.com" style="font-size:11px">
           <span class="field-hint">Obtenelo en <a href="https://console.cloud.google.com" target="_blank" style="color:var(--co-color2)">console.cloud.google.com</a> → APIs → Credenciales</span>
         </div>
         <div style="display:flex;align-items:flex-end;padding-bottom:4px">
@@ -1305,7 +1664,8 @@ function renderConfig() {
     <div class="config-block-body">
       <p style="color:var(--muted);font-size:13px;margin-bottom:14px">Exporta o importa todos los datos del sistema. El archivo JSON contiene empresas, clientes y facturas.</p>
       <div style="display:flex;gap:8px;flex-wrap:wrap">
-        <button class="btn btn-co btn-sm" onclick="exportFullBackup()">📥 Exportar JSON completo</button>
+        <button class="btn btn-co btn-sm" onclick="exportFullBackup()">📥 Exportar JSON</button>
+      <button class="btn btn-teal btn-sm" onclick="showBackupsModal()">🕐 Ver Backups</button>
         <label class="btn btn-outline btn-sm" style="cursor:pointer">📤 Importar JSON<input type="file" accept=".json" style="display:none" onchange="importFullBackup(event)"></label>
         <button class="btn btn-outline btn-sm" onclick="exportClientsExcel()">📊 Exportar Clientes Excel</button>
         <label class="btn btn-outline btn-sm" style="cursor:pointer">📂 Importar Clientes CSV<input type="file" accept=".csv,.xlsx,.xls" style="display:none" onchange="importClients(event)"></label>
@@ -1459,6 +1819,7 @@ function deleteInvoice(invId) {
 // ═══════════════════════════════════════════════════════════
 // CLIENT CRUD
 // ═══════════════════════════════════════════════════════════
+// editClient: defined below
 function saveClient(data) {
   if(!DB.clients[currentCoId]) DB.clients[currentCoId]=[];
   const list=DB.clients[currentCoId];
@@ -1551,7 +1912,7 @@ async function testEmail(){
 
 // DRIVE
 function driveAuth(){
-  const clientId = DB.config.googleClientId||'';
+  const clientId = DB.config.googleClientId||'432896723726-dlis1l0fc2too43d50d5pe7lgpvj24u9.apps.googleusercontent.com';
   if(!clientId || clientId.includes('YOUR_GOOGLE')) {
     toast('Primero configura tu Google Client ID en la sección de arriba','warn');
     document.getElementById('cfg-google-id')?.focus();
@@ -1605,17 +1966,7 @@ async function restoreFromDrive(){
     },'Restaurar');
   }catch(e){toast('Error: '+e.message,'err');}
 }
-function exportFullBackup(){const a=document.createElement('a');a.href=URL.createObjectURL(new Blob([JSON.stringify(DB,null,2)],{type:'application/json'}));a.download=`FactuFlow_${today()}.json`;a.click();toast('Backup exportado ✓');}
-function importFullBackup(e){const f=e.target.files[0];if(!f)return;const r=new FileReader();r.onload=(ev)=>{try{DB=JSON.parse(ev.target.result);saveDB();currentCoId=DB.companies[0]?.id||null;renderView();updateCoHeader();toast('✅ Datos importados');}catch(err){toast('Archivo inválido','err');}};r.readAsText(f);e.target.value='';}
-function clearAllData(){localStorage.removeItem(SK);seed();currentCoId=DB.companies[0]?.id||null;renderView();updateCoHeader();toast('Datos limpiados','warn');}
-function saveFxManual() {
-  const val = parseFloat(document.getElementById('cfg-fx-manual')?.value);
-  if(isNaN(val)||val<100){toast('Valor inválido','warn');return;}
-  _fxRate = val;
-  DB.config.exchangeRate = val;
-  DB.config.exchangeRateUpdated = new Date().toISOString();
-  saveDB(); updateFxWidget(); toast(`TC manual aplicado: ₡${val} por $1`);
-}
+// exportFullBackup: see PERSISTENCE LAYER v2
 function exportClients(){const cls=allCl();if(!cls.length){toast('Sin clientes','warn');return;}const keys=[...new Set(cls.flatMap(Object.keys))];const csv=[keys.join(','),...cls.map(r=>keys.map(k=>`"${(r[k]||'').toString().replace(/"/g,'""')}"`).join(','))].join('\n');const a=document.createElement('a');a.href=URL.createObjectURL(new Blob([csv],{type:'text/csv'}));a.download=`clientes_${co()?.shortName||'export'}.csv`;a.click();toast('Exportado ✓');}
 function _processImportRows(data) {
   if(!DB.clients[currentCoId]) DB.clients[currentCoId]=[];
@@ -1969,15 +2320,35 @@ function showInvModal(data){
     <button class="btn btn-co" onclick="submitInv('sent')"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M4 4h16c1.1 0 2 .9 2 2v12c0 1.1-.9 2-2 2H4c-1.1 0-2-.9-2-2V6c0-1.1.9-2 2-2z"/><polyline points="22,6 12,13 2,6"/></svg> Crear y Enviar</button>
   </div>`);
   renderLines(); renderTags('inv-cc');
+  // If a client was prefilled, populate condicion and formapago fields
+  if(prefillCl) {
+    setTimeout(()=>{
+      const cv = document.getElementById('inv-condventa');
+      if(cv && prefillCl.condicionVenta) cv.value = prefillCl.condicionVenta;
+      const fp = document.getElementById('inv-formapago');
+      if(fp && prefillCl.formaPago) fp.value = prefillCl.formaPago;
+      updateFxInvoice();
+    }, 50);
+  }
 }
 function autoFill(cl){
   const company=co();
+  // Find any money field to use as the invoice amount
   const rentF=(company.customFields||[]).find(f=>f.key==='rent');
-  const aptF=(company.customFields||[]).find(f=>f.key==='apartment');
-  if(rentF&&cl[rentF.key]){
-    const apt=aptF?(cl[aptF.key]||''):'';
-    _invItems=[{desc:`Alquiler${apt?' '+apt:''} – ${monthYearStr()}`,qty:1,price:parseFloat(cl[rentF.key])||0}];
-    if(cl.rentCurrency) _invCurr=cl.rentCurrency;
+  const moneyF=(company.customFields||[]).find(f=>f.type==='money');
+  const aptF=(company.customFields||[]).find(f=>f.key==='apartment'||f.key==='sector');
+  const primaryF = rentF || moneyF;
+  if(primaryF && cl[primaryF.key]) {
+    const apt = aptF ? (cl[aptF.key]||'') : '';
+    const label = primaryF.label||'Servicio';
+    const desc = rentF
+      ? `Alquiler${apt?' '+apt:''} – ${monthYearStr()}`
+      : `${label}${apt?' – '+apt:''} – ${monthYearStr()}`;
+    const price = parseFloat(cl[primaryF.key])||0;
+    const currKey = primaryF.key+'Currency';
+    _invItems=[{desc, qty:1, price}];
+    if(cl[currKey]) _invCurr=cl[currKey];
+    else if(cl.rentCurrency) _invCurr=cl.rentCurrency;
   }
 }
 function onClChange(id){
@@ -2081,7 +2452,7 @@ function exportReportExcel() {
   const rows = [['N° Factura','Cliente','Email','Fecha','Vencimiento','Estado','Moneda','Subtotal','IVA','Total','Condición','Forma de Pago','Empresa']];
   invs.forEach(inv=>{
     const company = DB.companies.find(c=>c.id===inv.coId)||{};
-    rows.push([inv.id,inv.clName,inv.clEmail,inv.date,inv.dueDate,inv.status,inv.currency||'USD',inv.subtotal||0,inv.tax>0?(inv.subtotal*inv.tax).toFixed(2):0,inv.total,inv.condicionVenta||'—',inv.formaPago||'—',company.name||'—']);
+    rows.push([inv.id,inv.clName,inv.clEmail,inv.date,inv.dueDate,inv.status,inv.currency||'USD',inv.subtotal||0,inv.tax>0?(inv.subtotal*inv.tax).toFixed(2):0,inv.total,(inv.condicionVenta||inv.condVenta||'—'),inv.formaPago||'—',company.name||'—']);
   });
   const ws = XLSX.utils.aoa_to_sheet(rows);
   ws['!cols']=[{wch:14},{wch:28},{wch:32},{wch:12},{wch:12},{wch:11},{wch:8},{wch:12},{wch:10},{wch:12},{wch:10},{wch:14},{wch:26}];
@@ -2205,10 +2576,12 @@ const INV_TEMPLATES = ['modern','classic','minimal'];
 // ═══════════════════════════════════════════════════════════
 // BOOT
 // ═══════════════════════════════════════════════════════════
-window.addEventListener('DOMContentLoaded',()=>{
-  // Clear only LEGACY storage keys (NOT the current key ff6_data)
-  ['ff5_data','ff4_data','ff3_data_v2','ff3_v4','ff3_data','ff2_data','ff_data_v2','ff_data'].forEach(k=>localStorage.removeItem(k));
-  loadDB();
+window.addEventListener('DOMContentLoaded', async ()=>{
+  // Clear LEGACY keys (not current)
+  ['ff5_data','ff4_data','ff3_data_v2','ff3_v4','ff3_data','ff2_data','ff_data_v2','ff_data']
+    .forEach(k=>localStorage.removeItem(k));
+  // loadDB is now async (IndexedDB)
+  await loadDB();
   driveToken=localStorage.getItem(DRIVE_TK);
   currentCoId=DB.companies[0]?.id||null;
   if(DB.config.emailjsPublic&&typeof emailjs!=='undefined') emailjs.init(DB.config.emailjsPublic);
