@@ -1911,7 +1911,7 @@ async function testEmail(){
 }
 
 // DRIVE
-function driveAuth(){
+function driveAuth(onSuccess){
   const clientId = DB.config.googleClientId||'432896723726-dlis1l0fc2too43d50d5pe7lgpvj24u9.apps.googleusercontent.com';
   if(!clientId || clientId.includes('YOUR_GOOGLE')) {
     toast('Primero configura tu Google Client ID en la sección de arriba','warn');
@@ -1921,13 +1921,15 @@ function driveAuth(){
   try {
     const client=google.accounts.oauth2.initTokenClient({
       client_id: clientId,
-      scope:'https://www.googleapis.com/auth/drive.file',
+      scope:'https://www.googleapis.com/auth/drive.appdata https://www.googleapis.com/auth/drive.file',
       callback:(resp)=>{
         if(resp.error){toast('Error Drive: '+resp.error,'err');return;}
         driveToken=resp.access_token;
         localStorage.setItem(DRIVE_TK,driveToken);
         toast('✅ Google Drive conectado');
-        updateCoHeader();renderView();
+        updateCoHeader();
+        if(typeof onSuccess==='function') onSuccess(driveToken);
+        else renderView();
       }
     });
     client.requestAccessToken();
@@ -1937,30 +1939,67 @@ function driveAuth(){
 }
 function driveDisconnect(){driveToken=null;localStorage.removeItem(DRIVE_TK);toast('Drive desconectado','warn');renderConfig();}
 async function backupNow(){
-  const token=driveToken||localStorage.getItem(DRIVE_TK);
-  if(!token){toast('Conecta Drive primero','warn');return;}
+  let token = driveToken || localStorage.getItem(DRIVE_TK);
+  if(!token){ toast('Conecta Drive primero','warn'); return; }
   toast('Respaldando…','info');
   try{
-    const data=JSON.stringify(DB,null,2);
-    const blob=new Blob([data],{type:'application/json'});
-    const name=`FactuFlow_${today()}.json`;
-    const meta=JSON.stringify({name,mimeType:'application/json',parents:['appDataFolder']});
-    const form=new FormData();form.append('metadata',new Blob([meta],{type:'application/json'}));form.append('file',blob);
-    const res=await fetch('https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart',{method:'POST',headers:{Authorization:`Bearer ${token}`},body:form});
-    if(!res.ok) throw new Error('HTTP '+res.status);
-    DB.config.lastBackup=new Date().toISOString();saveDB();
-    toast('☁️ Respaldo guardado ✓');updateCoHeader();
-  }catch(e){toast('Error: '+e.message,'err');}
+    const data = JSON.stringify(DB, null, 2);
+    const blob = new Blob([data], {type:'application/json'});
+    const name = `FactuFlow_${today()}.json`;
+    // Buscar carpeta FactuFlow_Backups en Drive (o crearla)
+    let folderId = null;
+    try {
+      const fq = await fetch(
+        "https://www.googleapis.com/drive/v3/files?q=name%3D'FactuFlow_Backups'+and+mimeType%3D'application%2Fvnd.google-apps.folder'+and+trashed%3Dfalse",
+        {headers:{Authorization:`Bearer ${token}`}}
+      );
+      if(fq.ok){ const fl=await fq.json(); folderId=fl.files?.[0]?.id||null; }
+      if(!folderId){
+        const mk=await fetch('https://www.googleapis.com/drive/v3/files',{
+          method:'POST',
+          headers:{Authorization:`Bearer ${token}`,'Content-Type':'application/json'},
+          body:JSON.stringify({name:'FactuFlow_Backups',mimeType:'application/vnd.google-apps.folder'})
+        });
+        if(mk.ok){const mkj=await mk.json();folderId=mkj.id;}
+      }
+    } catch(fe){ /* usar raíz si falla */ }
+    const meta = JSON.stringify({name, mimeType:'application/json', parents: folderId?[folderId]:[]});
+    const form = new FormData();
+    form.append('metadata', new Blob([meta],{type:'application/json'}));
+    form.append('file', blob);
+    const res = await fetch('https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart',{
+      method:'POST', headers:{Authorization:`Bearer ${token}`}, body:form
+    });
+    // 401 = token expirado → reconectar automáticamente
+    if(res.status === 401) {
+      toast('Token expirado — reconectando Drive…','warn');
+      driveToken = null;
+      localStorage.removeItem(DRIVE_TK);
+      // Pedir nuevo token y reintentar
+      driveAuth(async (newToken) => {
+        if(newToken) await backupNow();
+      });
+      return;
+    }
+    if(!res.ok) throw new Error('HTTP '+res.status+' — '+await res.text());
+    DB.config.lastBackup = new Date().toISOString();
+    saveDB();
+    toast('☁️ Respaldo en Drive guardado ✓');
+    updateCoHeader();
+  } catch(e) {
+    toast('Error Drive: '+e.message,'err');
+  }
 }
 async function restoreFromDrive(){
   const token=driveToken||localStorage.getItem(DRIVE_TK);if(!token){toast('Conecta Drive primero','warn');return;}
   try{
-    const listRes=await fetch(`https://www.googleapis.com/drive/v3/files?spaces=appDataFolder&q=name+contains+'FactuFlow'&orderBy=createdTime+desc&pageSize=5`,{headers:{Authorization:`Bearer ${token}`}});
+    const listRes=await fetch(`https://www.googleapis.com/drive/v3/files?q=name+contains+'FactuFlow'+and+trashed=false&orderBy=createdTime+desc&pageSize=10`,{headers:{Authorization:`Bearer ${token}`}});
     const list=await listRes.json();
     if(!list.files?.length){toast('Sin respaldos en Drive','warn');return;}
     const latest=list.files[0];
     confirmDel(`restaurar "${latest.name}"`,async()=>{
       const fr=await fetch(`https://www.googleapis.com/drive/v3/files/${latest.id}?alt=media`,{headers:{Authorization:`Bearer ${token}`}});
+      if(fr.status===401){toast('Token expirado — reconectá Drive en Configuración','warn');driveToken=null;localStorage.removeItem(DRIVE_TK);updateCoHeader();return;}
       DB=await fr.json();saveDB();currentCoId=DB.companies[0]?.id||null;
       toast('✅ Datos restaurados');renderView();updateCoHeader();
     },'Restaurar');
